@@ -47,6 +47,8 @@ dependencies:
   device_info_plus: ^13.2.0
   shared_preferences: ^2.5.5
   android_id: ^0.5.1
+  http: ^1.2.2
+  http_parser: ^4.0.2
 
 dev_dependencies:
   flutter_test:

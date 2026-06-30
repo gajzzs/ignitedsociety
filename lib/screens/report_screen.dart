@@ -3,6 +3,10 @@ import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
+import 'package:geolocator/geolocator.dart';
+import '../services/diagnostic_service.dart';
+import '../models/verification_output.dart';
+import '../utils/location_utils.dart';
 
 class ReportScreen extends StatefulWidget {
   /// Coordinates passed in from the home map — either the device's current
@@ -30,12 +34,18 @@ class _ReportScreenState extends State<ReportScreen> {
   final TextEditingController _notesController = TextEditingController();
   String _urgency = 'Medium';
   bool _isAnalyzing = false;
-  String? _aiResult;
+  VerificationOutput? _verificationResult;
+  String? _analysisError;
+  Position? _resolvedPosition;
 
   // Step 3: Location / Submission variables
   final String _fallbackLocation = "Varanasi, UP (25.3176° N, 82.9739° E)";
 
   String get _locationText {
+    if (_resolvedPosition != null) {
+      return '${_resolvedPosition!.latitude.toStringAsFixed(5)}° N, '
+          '${_resolvedPosition!.longitude.toStringAsFixed(5)}° E';
+    }
     final loc = widget.location;
     if (loc != null) {
       return '${loc.latitude.toStringAsFixed(5)}° N, ${loc.longitude.toStringAsFixed(5)}° E';
@@ -191,22 +201,52 @@ class _ReportScreenState extends State<ReportScreen> {
 
     setState(() {
       _isAnalyzing = true;
-      _aiResult = null;
+      _verificationResult = null;
+      _analysisError = null;
     });
 
-    // Simulated Gemini AI response
-    await Future.delayed(const Duration(seconds: 3));
+    try {
+      // 1. Resolve current coordinates from the location service.
+      double latitude;
+      double longitude;
+      if (widget.location != null) {
+        // A location was explicitly picked on the map — prefer it.
+        latitude = widget.location!.latitude;
+        longitude = widget.location!.longitude;
+      } else {
+        final position = await determineCurrentPosition();
+        if (mounted) {
+          setState(() => _resolvedPosition = position);
+        }
+        latitude = position.latitude;
+        longitude = position.longitude;
+      }
 
-    if (!mounted) return;
-    setState(() {
-      _isAnalyzing = false;
-      _aiResult = "AI Categorization: Road Hazard (Pothole)\n"
-          "Urgency Level: High\n"
-          "Impact Score: 8.5/10\n"
-          "Confidence: 94%\n\n"
-          "Suggested action: Fill with asphalt patch.";
-      _urgency = "High"; // Sync based on AI analysis
-    });
+      // 2. Send images + description + coordinates, wait for the agent.
+      final result = await DiagnosticService.analyzeIssue(
+        images: _imageFiles.map((x) => File(x.path)).toList(),
+        description: _notesController.text,
+        latitude: latitude,
+        longitude: longitude,
+      );
+
+      if (!mounted) return;
+      setState(() {
+        _isAnalyzing = false;
+        _verificationResult = result;
+        // Sync urgency from the AI's risk score so Step 3 reflects it.
+        if (result.riskAssessment != null) {
+          final score = result.riskAssessment!.riskScore;
+          _urgency = score >= 70 ? 'High' : (score >= 40 ? 'Medium' : 'Low');
+        }
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _isAnalyzing = false;
+        _analysisError = e.toString();
+      });
+    }
   }
 
   void _nextStep() {
@@ -644,38 +684,172 @@ class _ReportScreenState extends State<ReportScreen> {
                   ),
                   const SizedBox(width: 12),
                   Text(
-                    'Gemini AI is analyzing the image...',
+                    'AI is analyzing the issue...',
                     style: TextStyle(fontWeight: FontWeight.bold, color: Colors.teal[800], fontSize: 14),
                   ),
                 ],
               ),
             ),
-          ] else if (_aiResult != null) ...[
+          ] else if (_analysisError != null) ...[
             Container(
               padding: const EdgeInsets.all(16),
               decoration: BoxDecoration(
-                color: Colors.teal[50],
-                border: Border.all(color: Colors.teal[200]!),
+                color: Colors.red[50],
+                border: Border.all(color: Colors.red[200]!),
                 borderRadius: BorderRadius.circular(12),
               ),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Row(
+                  Row(
                     children: [
-                      Icon(Icons.auto_awesome, color: Colors.teal),
-                      SizedBox(width: 8),
+                      Icon(Icons.error_outline, color: Colors.red[700]),
+                      const SizedBox(width: 8),
                       Text(
-                        'Gemini AI Analysis',
-                        style: TextStyle(fontWeight: FontWeight.bold, color: Colors.teal, fontSize: 15),
+                        'Analysis failed',
+                        style: TextStyle(fontWeight: FontWeight.bold, color: Colors.red[800], fontSize: 15),
                       ),
                     ],
                   ),
-                  const Divider(color: Colors.teal),
-                  Text(
-                    _aiResult!,
-                    style: TextStyle(fontSize: 14, color: Colors.teal[900], height: 1.4),
+                  const SizedBox(height: 8),
+                  Text(_analysisError!, style: TextStyle(fontSize: 13, color: Colors.red[900])),
+                  const SizedBox(height: 12),
+                  TextButton.icon(
+                    onPressed: _analyzeIssue,
+                    icon: const Icon(Icons.refresh, size: 18),
+                    label: const Text('Retry'),
                   ),
+                ],
+              ),
+            ),
+          ] else if (_verificationResult != null) ...[
+            _buildVerificationResultCard(_verificationResult!),
+          ],
+        ],
+      ),
+    );
+  }
+
+  // --- Renders the parsed VerificationOutput as tags + risk summary ---
+  Widget _buildVerificationResultCard(VerificationOutput result) {
+    final cat = result.issueCategorization;
+    final risk = result.riskAssessment;
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.grey[50],
+        border: Border.all(color: Colors.grey[300]!),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(
+            children: [
+              Icon(Icons.auto_awesome, color: Colors.deepPurple),
+              SizedBox(width: 8),
+              Text(
+                'AI Verification',
+                style: TextStyle(fontWeight: FontWeight.bold, color: Colors.deepPurple, fontSize: 15),
+              ),
+            ],
+          ),
+          const Divider(),
+
+          // Clarifying questions take priority — the agent needs more info.
+          if (result.needsClarification) ...[
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.amber[50],
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.amber[300]!),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Icon(Icons.help_outline, color: Colors.amber[800], size: 18),
+                      const SizedBox(width: 6),
+                      Text(
+                        'A few more details would help',
+                        style: TextStyle(fontWeight: FontWeight.bold, color: Colors.amber[900], fontSize: 13),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  ...result.clarifyingQuestions.map(
+                    (q) => Padding(
+                      padding: const EdgeInsets.only(bottom: 4),
+                      child: Text('•  $q', style: TextStyle(fontSize: 13, color: Colors.amber[900])),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+          ],
+
+          // Category tag, in the category's color.
+          if (cat != null) ...[
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                Chip(
+                  avatar: Icon(cat.icon, color: Colors.white, size: 18),
+                  label: Text(
+                    cat.category,
+                    style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                  ),
+                  backgroundColor: cat.color,
+                ),
+                if (cat.subcategory != null)
+                  Chip(
+                    label: Text(cat.subcategory!),
+                    backgroundColor: cat.color.withOpacity(0.12),
+                    labelStyle: TextStyle(color: cat.color, fontWeight: FontWeight.w600),
+                  ),
+                Chip(
+                  label: Text('${(cat.confidence * 100).toStringAsFixed(0)}% confidence'),
+                  backgroundColor: Colors.grey[200],
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            Text(
+              cat.visualEvidenceSummary,
+              style: const TextStyle(fontSize: 13, height: 1.4),
+            ),
+          ],
+
+          // Risk badge.
+          if (risk != null) ...[
+            const SizedBox(height: 14),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: risk.color.withOpacity(0.10),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: risk.color.withOpacity(0.4)),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Icon(Icons.speed, color: risk.color, size: 18),
+                      const SizedBox(width: 6),
+                      Text(
+                        'Risk Score: ${risk.riskScore}/100',
+                        style: TextStyle(fontWeight: FontWeight.bold, color: risk.color, fontSize: 13),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Text(risk.recommendation, style: const TextStyle(fontSize: 13, height: 1.4)),
                 ],
               ),
             ),
@@ -685,7 +859,6 @@ class _ReportScreenState extends State<ReportScreen> {
     );
   }
 
-  // --- Step 3: Confirmation / Submit Screen ---
   Widget _buildStepSubmit() {
     return Padding(
       padding: const EdgeInsets.all(20.0),
@@ -718,6 +891,15 @@ class _ReportScreenState extends State<ReportScreen> {
                     title: const Text('Location'),
                     subtitle: Text(_locationText),
                   ),
+                  if (_verificationResult?.issueCategorization != null)
+                    ListTile(
+                      leading: Icon(
+                        _verificationResult!.issueCategorization!.icon,
+                        color: _verificationResult!.issueCategorization!.color,
+                      ),
+                      title: const Text('Category'),
+                      subtitle: Text(_verificationResult!.issueCategorization!.category),
+                    ),
                   ListTile(
                     leading: const Icon(Icons.photo_library, color: Colors.blue),
                     title: const Text('Photos'),
